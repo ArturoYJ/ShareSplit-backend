@@ -1,15 +1,28 @@
 const express = require('express');
-const router = express.Router({ mergeParams: true }); // hereda :groupId
+const router = express.Router({ mergeParams: true });
 const { body, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
 const pool = require('../db/pool');
 const { authenticate } = require('../middleware/auth');
+const { computeBalancesAndDebts, toCents } = require('../utils/finance');
+const { sendError } = require('../utils/http');
+
+// Rate limiter exclusivo para operaciones de pago
+const paymentsLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_PAYMENTS_MAX || 80),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) =>
+    sendError(res, 429, 'Límite de operaciones de pago excedido', 'PAYMENT_RATE_LIMIT_EXCEEDED'),
+});
 
 router.use(authenticate);
 
 function handleValidationErrors(req, res) {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    res.status(422).json({ errors: errors.array() });
+    sendError(res, 422, 'Error de validación', 'VALIDATION_ERROR', errors.array());
     return true;
   }
   return false;
@@ -17,195 +30,45 @@ function handleValidationErrors(req, res) {
 
 async function requireMembership(groupId, userId, res) {
   const r = await pool.query(
-    'SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2',
+    'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2',
     [groupId, userId]
   );
   if (r.rows.length === 0) {
-    res.status(403).json({ error: 'No tienes acceso a este grupo' });
+    sendError(res, 403, 'No tienes acceso a este grupo', 'FORBIDDEN_GROUP_ACCESS');
+    return null;
+  }
+  return r.rows[0].role;
+}
+
+async function requireOwner(groupId, userId, res) {
+  const role = await requireMembership(groupId, userId, res);
+  if (!role) return false;
+  if (role !== 'owner') {
+    sendError(res, 403, 'Solo el owner puede realizar esta acción', 'FORBIDDEN_OWNER_ONLY');
     return false;
   }
   return true;
 }
 
-// ── GET /groups/:groupId/balances — Calcular saldos netos ────────────────────
-//
-// Lógica:
-//   saldo(user) = Σ gastos pagados por user - Σ consumo asignado a user
-//
-// Consumo asignado = para cada ítem reclamado:
-//   (unit_price * quantity) / número de personas que reclamaron ese ítem
-//
-// Un saldo positivo significa que los demás le deben al usuario.
-// Un saldo negativo significa que el usuario le debe a los demás.
-
-router.get('/', async (req, res) => {
+router.get('/balances', async (req, res) => {
   const { groupId } = req.params;
   const userId = req.user.id;
 
-  const isMember = await requireMembership(groupId, userId, res);
-  if (!isMember) return;
+  const role = await requireMembership(groupId, userId, res);
+  if (!role) return;
 
   try {
-    // 1. Lo que cada usuario pagó (en gastos open o settled)
-    const paidResult = await pool.query(
-      `SELECT
-         e.paid_by AS user_id,
-         SUM(e.total_amount) AS total_paid
-       FROM expenses e
-       WHERE e.group_id = $1
-         AND e.status IN ('open', 'settled')
-       GROUP BY e.paid_by`,
-      [groupId]
-    );
-
-    // 2. Lo que cada usuario debe (suma de su parte en cada ítem reclamado)
-    const owedResult = await pool.query(
-      `SELECT
-         ic.user_id,
-         SUM(
-           (ei.unit_price * ei.quantity) /
-           NULLIF(claimant_counts.cnt, 0)
-         ) AS total_owed
-       FROM item_claims ic
-       JOIN expense_items ei ON ei.id = ic.item_id
-       JOIN expenses e ON e.id = ei.expense_id
-       JOIN (
-         SELECT item_id, COUNT(*) AS cnt
-         FROM item_claims
-         GROUP BY item_id
-       ) claimant_counts ON claimant_counts.item_id = ic.item_id
-       WHERE e.group_id = $1
-         AND e.status IN ('open', 'settled')
-       GROUP BY ic.user_id`,
-      [groupId]
-    );
-
-    // 3. Pagos realizados (reembolsos)
-    const paymentsResult = await pool.query(
-      `SELECT from_user_id, to_user_id, SUM(amount) AS total
-       FROM payments
-       WHERE group_id = $1
-       GROUP BY from_user_id, to_user_id`,
-      [groupId]
-    );
-
-    // 4. Obtener todos los miembros del grupo
-    const membersResult = await pool.query(
-      `SELECT u.id, u.name, u.email, u.avatar_url
-       FROM users u
-       JOIN group_members gm ON gm.user_id = u.id
-       WHERE gm.group_id = $1`,
-      [groupId]
-    );
-
-    // 5. Construir mapa de saldos
-    const balanceMap = {};
-    membersResult.rows.forEach((m) => {
-      balanceMap[m.id] = {
-        user_id: m.id,
-        name: m.name,
-        email: m.email,
-        avatar_url: m.avatar_url,
-        total_paid: 0,
-        total_owed: 0,
-        payments_sent: 0,
-        payments_received: 0,
-        net_balance: 0, // positivo = te deben, negativo = debes
-      };
-    });
-
-    paidResult.rows.forEach((r) => {
-      if (balanceMap[r.user_id]) {
-        balanceMap[r.user_id].total_paid = parseFloat(r.total_paid);
-      }
-    });
-
-    owedResult.rows.forEach((r) => {
-      if (balanceMap[r.user_id]) {
-        balanceMap[r.user_id].total_owed = parseFloat(r.total_owed);
-      }
-    });
-
-    paymentsResult.rows.forEach((p) => {
-      if (balanceMap[p.from_user_id]) {
-        balanceMap[p.from_user_id].payments_sent += parseFloat(p.total);
-      }
-      if (balanceMap[p.to_user_id]) {
-        balanceMap[p.to_user_id].payments_received += parseFloat(p.total);
-      }
-    });
-
-    // net_balance = pagué - me asignaron - lo que envié + lo que recibí
-    const balances = Object.values(balanceMap).map((b) => ({
-      ...b,
-      net_balance: parseFloat(
-        (
-          b.total_paid -
-          b.total_owed -
-          b.payments_sent +
-          b.payments_received
-        ).toFixed(2)
-      ),
-    }));
-
-    // 6. Calcular deudas simplificadas (quién le paga a quién)
-    const debts = simplifyDebts(balances);
-
+    const { balances, debts } = await computeBalancesAndDebts(pool, groupId);
     res.json({ balances, debts });
   } catch (err) {
     console.error('[balances/get]', err.message);
-    res.status(500).json({ error: 'Error al calcular balances' });
+    sendError(res, 500, 'Error al calcular balances', 'BALANCES_CALCULATION_ERROR');
   }
 });
 
-/**
- * Algoritmo greedy para simplificar deudas:
- * Devuelve un array de { from_user_id, from_name, to_user_id, to_name, amount }
- */
-function simplifyDebts(balances) {
-  const debts = [];
-
-  // Separar deudores (net < 0) y acreedores (net > 0)
-  const debtors = balances
-    .filter((b) => b.net_balance < -0.01)
-    .map((b) => ({ ...b, amount: Math.abs(b.net_balance) }))
-    .sort((a, b) => b.amount - a.amount);
-
-  const creditors = balances
-    .filter((b) => b.net_balance > 0.01)
-    .map((b) => ({ ...b, amount: b.net_balance }))
-    .sort((a, b) => b.amount - a.amount);
-
-  let i = 0, j = 0;
-  while (i < debtors.length && j < creditors.length) {
-    const debtor = debtors[i];
-    const creditor = creditors[j];
-    const amount = Math.min(debtor.amount, creditor.amount);
-
-    if (amount > 0.01) {
-      debts.push({
-        from_user_id: debtor.user_id,
-        from_name: debtor.name,
-        to_user_id: creditor.user_id,
-        to_name: creditor.name,
-        amount: parseFloat(amount.toFixed(2)),
-      });
-    }
-
-    debtor.amount -= amount;
-    creditor.amount -= amount;
-
-    if (debtor.amount < 0.01) i++;
-    if (creditor.amount < 0.01) j++;
-  }
-
-  return debts;
-}
-
-// ── POST /groups/:groupId/payments — Registrar pago ──────────────────────────
-
 router.post(
   '/payments',
+  paymentsLimiter,
   [
     body('to_user_id').isUUID().withMessage('to_user_id debe ser un UUID válido'),
     body('amount').isFloat({ gt: 0 }).withMessage('El monto debe ser mayor a 0'),
@@ -219,64 +82,190 @@ router.post(
     const { to_user_id, amount, note } = req.body;
 
     if (fromUserId === to_user_id) {
-      return res.status(400).json({ error: 'No puedes pagarte a ti mismo' });
+      return sendError(res, 400, 'No puedes pagarte a ti mismo', 'INVALID_SELF_PAYMENT');
     }
 
-    const isMember = await requireMembership(groupId, fromUserId, res);
-    if (!isMember) return;
+    const role = await requireMembership(groupId, fromUserId, res);
+    if (!role) return;
 
+    const amountCents = toCents(amount);
+
+    const client = await pool.connect();
     try {
-      // Verificar que el destinatario también sea miembro
-      const toMember = await pool.query(
+      await client.query('BEGIN');
+
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [`payment:${groupId}:${fromUserId}:${to_user_id}`]
+      );
+
+      const toMember = await client.query(
         'SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2',
         [groupId, to_user_id]
       );
       if (toMember.rows.length === 0) {
-        return res.status(400).json({ error: 'El destinatario no es miembro del grupo' });
+        await client.query('ROLLBACK');
+        return sendError(res, 400, 'El destinatario no es miembro del grupo', 'INVALID_PAYMENT_TARGET');
       }
 
-      const result = await pool.query(
+      const { debtsByPair } = await computeBalancesAndDebts(client, groupId);
+      const currentDebtCents = debtsByPair.get(`${fromUserId}:${to_user_id}`) || 0;
+
+      if (currentDebtCents <= 0) {
+        await client.query('ROLLBACK');
+        return sendError(
+          res,
+          409,
+          'No existe deuda pendiente entre estos usuarios',
+          'NO_ACTIVE_DEBT',
+          { current_debt: 0 }
+        );
+      }
+
+      if (amountCents > currentDebtCents) {
+        await client.query('ROLLBACK');
+        return sendError(
+          res,
+          409,
+          'El monto excede la deuda pendiente',
+          'OVERPAYMENT_NOT_ALLOWED',
+          {
+            requested_amount: Number(amount),
+            current_debt: Number((currentDebtCents / 100).toFixed(2)),
+          }
+        );
+      }
+
+      const result = await client.query(
         `INSERT INTO payments (group_id, from_user_id, to_user_id, amount, note)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING *`,
-        [groupId, fromUserId, to_user_id, amount, note]
+        [groupId, fromUserId, to_user_id, Number(amount).toFixed(2), note]
       );
 
+      await client.query('COMMIT');
       res.status(201).json({ payment: result.rows[0] });
     } catch (err) {
+      await client.query('ROLLBACK');
       console.error('[balances/payment]', err.message);
-      res.status(500).json({ error: 'Error al registrar el pago' });
+      sendError(res, 500, 'Error al registrar el pago', 'PAYMENT_REGISTRATION_ERROR');
+    } finally {
+      client.release();
     }
   }
 );
 
-// ── GET /groups/:groupId/payments — Historial de pagos ───────────────────────
-
-router.get('/payments', async (req, res) => {
+router.get('/payments', paymentsLimiter, async (req, res) => {
   const { groupId } = req.params;
   const userId = req.user.id;
 
-  const isMember = await requireMembership(groupId, userId, res);
-  if (!isMember) return;
+  const role = await requireMembership(groupId, userId, res);
+  if (!role) return;
+
+  const page  = Math.max(1, parseInt(req.query.page)  || 1);
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+  const offset = (page - 1) * limit;
 
   try {
-    const result = await pool.query(
+    const [countResult, dataResult] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*) AS total FROM payments WHERE group_id = $1`,
+        [groupId]
+      ),
+      pool.query(
+        `SELECT
+           p.*,
+           uf.name AS from_name,
+           ut.name AS to_name
+         FROM payments p
+         JOIN users uf ON uf.id = p.from_user_id
+         JOIN users ut ON ut.id = p.to_user_id
+         WHERE p.group_id = $1
+         ORDER BY p.paid_at DESC
+         LIMIT $2 OFFSET $3`,
+        [groupId, limit, offset]
+      ),
+    ]);
+
+    res.json({
+      payments: dataResult.rows,
+      total: Number(countResult.rows[0].total),
+      page,
+      limit,
+    });
+  } catch (err) {
+    console.error('[balances/payments-list]', err.message);
+    sendError(res, 500, 'Error al obtener historial de pagos', 'PAYMENTS_LIST_ERROR');
+  }
+});
+
+router.post('/settle-all', async (req, res) => {
+  const { groupId } = req.params;
+  const userId = req.user.id;
+
+  const isOwner = await requireOwner(groupId, userId, res);
+  if (!isOwner) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const unclaimedItemsResult = await client.query(
       `SELECT
-         p.*,
-         uf.name AS from_name,
-         ut.name AS to_name
-       FROM payments p
-       JOIN users uf ON uf.id = p.from_user_id
-       JOIN users ut ON ut.id = p.to_user_id
-       WHERE p.group_id = $1
-       ORDER BY p.paid_at DESC`,
+         e.id AS expense_id,
+         e.title AS expense_title,
+         ei.id AS item_id,
+         ei.name AS item_name,
+         (ei.unit_price * ei.quantity) AS total_price
+       FROM expenses e
+       JOIN expense_items ei ON ei.expense_id = e.id
+       LEFT JOIN item_claims ic ON ic.item_id = ei.id
+       WHERE e.group_id = $1
+         AND e.status = 'open'
+       GROUP BY e.id, e.title, ei.id
+       HAVING COUNT(ic.user_id) = 0
+       ORDER BY e.created_at DESC, ei.name ASC
+       LIMIT 30`,
       [groupId]
     );
 
-    res.json({ payments: result.rows });
+    if (unclaimedItemsResult.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return sendError(
+        res,
+        409,
+        'No se pueden liquidar los gastos: existen ítems sin reclamar',
+        'UNCLAIMED_ITEMS_BLOCK_SETTLEMENT',
+        {
+          unclaimed_items: unclaimedItemsResult.rows.map((row) => ({
+            expense_id: row.expense_id,
+            expense_title: row.expense_title,
+            item_id: row.item_id,
+            item_name: row.item_name,
+            total_price: Number(row.total_price).toFixed(2),
+          })),
+        }
+      );
+    }
+
+    const result = await client.query(
+      `UPDATE expenses SET status = 'settled'
+       WHERE group_id = $1 AND status = 'open'
+       RETURNING id`,
+      [groupId]
+    );
+
+    await client.query('COMMIT');
+    res.json({
+      message: `${result.rowCount} gasto(s) liquidado(s)`,
+      settled_count: result.rowCount,
+    });
   } catch (err) {
-    console.error('[balances/payments-list]', err.message);
-    res.status(500).json({ error: 'Error al obtener historial de pagos' });
+    await client.query('ROLLBACK');
+    console.error('[balances/settle-all]', err.message);
+    sendError(res, 500, 'Error al liquidar gastos', 'SETTLE_ALL_ERROR');
+  } finally {
+    client.release();
   }
 });
 
