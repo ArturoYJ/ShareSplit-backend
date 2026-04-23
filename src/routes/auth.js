@@ -4,6 +4,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const pool = require('../db/pool');
+const { authenticate } = require('../middleware/auth');
+const { sendError } = require('../utils/http');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -13,6 +15,25 @@ function signToken(user) {
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
+}
+
+/**
+ * Emite la cookie httpOnly ss_token.
+ * - httpOnly: no accesible por JS en el navegador (previene XSS)
+ * - secure: solo HTTPS en producción
+ * - sameSite: 'lax' bloquea CSRF en navegadores modernos
+ * - maxAge: igual al TTL del JWT (7 días por defecto)
+ */
+function setAuthCookie(res, token) {
+  const isProd = process.env.NODE_ENV === 'production';
+  const maxAgeDays = parseInt(process.env.JWT_EXPIRES_IN || '7d', 10) || 7;
+  res.cookie('ss_token', token, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+    maxAge: maxAgeDays * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
 }
 
 function handleValidationErrors(req, res) {
@@ -47,7 +68,7 @@ router.post(
         [email]
       );
       if (existing.rows.length > 0) {
-        return res.status(409).json({ error: 'El email ya está registrado' });
+        return sendError(res, 409, 'El email ya está registrado', 'AUTH_EMAIL_EXISTS');
       }
 
       // Hash de la contraseña
@@ -64,6 +85,8 @@ router.post(
       const user = result.rows[0];
       const token = signToken(user);
 
+      setAuthCookie(res, token);
+
       res.status(201).json({
         message: 'Usuario creado exitosamente',
         token,
@@ -71,7 +94,7 @@ router.post(
       });
     } catch (err) {
       console.error('[auth/register]', err.message);
-      res.status(500).json({ error: 'Error interno del servidor' });
+      sendError(res, 500, 'Error interno del servidor', 'INTERNAL_ERROR');
     }
   }
 );
@@ -98,15 +121,17 @@ router.post(
       const user = result.rows[0];
 
       if (!user) {
-        return res.status(401).json({ error: 'Credenciales inválidas' });
+        return sendError(res, 401, 'Credenciales inválidas', 'AUTH_INVALID_CREDENTIALS');
       }
 
       const valid = await bcrypt.compare(password, user.password);
       if (!valid) {
-        return res.status(401).json({ error: 'Credenciales inválidas' });
+        return sendError(res, 401, 'Credenciales inválidas', 'AUTH_INVALID_CREDENTIALS');
       }
 
       const token = signToken(user);
+
+      setAuthCookie(res, token);
 
       res.json({
         token,
@@ -114,14 +139,12 @@ router.post(
       });
     } catch (err) {
       console.error('[auth/login]', err.message);
-      res.status(500).json({ error: 'Error interno del servidor' });
+      sendError(res, 500, 'Error interno del servidor', 'INTERNAL_ERROR');
     }
   }
 );
 
 // ── GET /auth/me ──────────────────────────────────────────────────────────────
-
-const { authenticate } = require('../middleware/auth');
 
 router.get('/me', authenticate, async (req, res) => {
   try {
@@ -130,13 +153,91 @@ router.get('/me', authenticate, async (req, res) => {
       [req.user.id]
     );
     if (!result.rows[0]) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
+      return sendError(res, 404, 'Usuario no encontrado', 'AUTH_USER_NOT_FOUND');
     }
-    res.json({ user: result.rows[0] });
+    // Retorna también el token (de cookie o bearer) para que el frontend
+    // pueda restaurar la sesión en memoria sin guardar nada en localStorage.
+    const token = req.cookies?.ss_token ||
+      (req.headers['authorization']?.split(' ')[1] ?? null);
+    res.json({ user: result.rows[0], token });
   } catch (err) {
     console.error('[auth/me]', err.message);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    sendError(res, 500, 'Error interno del servidor', 'INTERNAL_ERROR');
   }
 });
+
+// ── POST /auth/logout — Cierra sesión (limpia cookie) ─────────────────────────
+
+router.post('/logout', (_req, res) => {
+  res.clearCookie('ss_token', { path: '/', httpOnly: true });
+  res.json({ message: 'Sesión cerrada' });
+});
+
+// ── PATCH /auth/me — Actualizar perfil ───────────────────────────────────────
+
+router.patch(
+  '/me',
+  authenticate,
+  [
+    body('name')
+      .optional()
+      .trim()
+      .notEmpty()
+      .withMessage('El nombre no puede estar vacío'),
+    body('email')
+      .optional()
+      .isEmail()
+      .normalizeEmail()
+      .withMessage('Email inválido'),
+    body('avatar_url')
+      .optional({ nullable: true })
+      .isURL()
+      .withMessage('La URL del avatar no es válida'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(422).json({ errors: errors.array() });
+    }
+
+    const { name, email, avatar_url } = req.body;
+    const userId = req.user.id;
+
+    // Si no viene ningún campo, nada que actualizar
+    if (name === undefined && email === undefined && avatar_url === undefined) {
+      return sendError(res, 400, 'Debes enviar al menos un campo para actualizar', 'NO_FIELDS_PROVIDED');
+    }
+
+    try {
+      // Verificar unicidad de email si se va a cambiar
+      if (email) {
+        const emailCheck = await pool.query(
+          'SELECT id FROM users WHERE email = $1 AND id != $2',
+          [email, userId]
+        );
+        if (emailCheck.rows.length > 0) {
+          return sendError(res, 409, 'Ese email ya está en uso por otra cuenta', 'AUTH_EMAIL_EXISTS');
+        }
+      }
+
+      const result = await pool.query(
+        `UPDATE users
+         SET
+           name       = COALESCE($1, name),
+           email      = COALESCE($2, email),
+           avatar_url = COALESCE($3, avatar_url),
+           updated_at = NOW()
+         WHERE id = $4
+         RETURNING id, name, email, avatar_url, created_at`,
+        [name ?? null, email ?? null, avatar_url ?? null, userId]
+      );
+
+      res.json({ user: result.rows[0] });
+    } catch (err) {
+      console.error('[auth/patch-me]', err.message);
+      sendError(res, 500, 'Error al actualizar el perfil', 'INTERNAL_ERROR');
+    }
+  }
+);
 
 module.exports = router;
