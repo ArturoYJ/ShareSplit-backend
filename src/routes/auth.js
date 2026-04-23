@@ -26,7 +26,9 @@ function signToken(user) {
  */
 function setAuthCookie(res, token) {
   const isProd = process.env.NODE_ENV === 'production';
-  const maxAgeDays = parseInt(process.env.JWT_EXPIRES_IN || '7d', 10) || 7;
+  // parseInt('7d', 10) returns NaN — strip non-numeric chars before parsing
+  const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
+  const maxAgeDays = parseInt(expiresIn.replace(/[^0-9]/g, ''), 10) || 7;
   res.cookie('ss_token', token, {
     httpOnly: true,
     secure: isProd,
@@ -155,11 +157,7 @@ router.get('/me', authenticate, async (req, res) => {
     if (!result.rows[0]) {
       return sendError(res, 404, 'Usuario no encontrado', 'AUTH_USER_NOT_FOUND');
     }
-    // Retorna también el token (de cookie o bearer) para que el frontend
-    // pueda restaurar la sesión en memoria sin guardar nada en localStorage.
-    const token = req.cookies?.ss_token ||
-      (req.headers['authorization']?.split(' ')[1] ?? null);
-    res.json({ user: result.rows[0], token });
+    res.json({ user: result.rows[0] });
   } catch (err) {
     console.error('[auth/me]', err.message);
     sendError(res, 500, 'Error interno del servidor', 'INTERNAL_ERROR');
@@ -169,7 +167,14 @@ router.get('/me', authenticate, async (req, res) => {
 // ── POST /auth/logout — Cierra sesión (limpia cookie) ─────────────────────────
 
 router.post('/logout', (_req, res) => {
-  res.clearCookie('ss_token', { path: '/', httpOnly: true });
+  const isProd = process.env.NODE_ENV === 'production';
+  // Attributes must match those used in setAuthCookie; otherwise browsers ignore clearCookie
+  res.clearCookie('ss_token', {
+    path: '/',
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+  });
   res.json({ message: 'Sesión cerrada' });
 });
 
