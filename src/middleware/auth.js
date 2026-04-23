@@ -1,18 +1,26 @@
 const jwt = require('jsonwebtoken');
+const { sendError } = require('../utils/http');
 
 /**
  * Middleware de autenticación JWT.
- * Espera el header: Authorization: Bearer <token>
+ * Lee el token desde (en orden de prioridad):
+ *   1. Cookie httpOnly: ss_token  (flujo con cookies)
+ *   2. Header: Authorization: Bearer <token>  (flujo legacy / APIs externas)
  * Si es válido, adjunta req.user = { id, email, name }
  */
 function authenticate(req, res, next) {
+  // 1️⃣  Cookie httpOnly
+  const cookieToken = req.cookies?.ss_token;
+  // 2️⃣  Bearer header
   const authHeader = req.headers['authorization'];
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token de autorización requerido' });
+  const token = cookieToken || bearerToken;
+
+  if (!token) {
+    return sendError(res, 401, 'Token de autorización requerido', 'AUTH_TOKEN_REQUIRED');
   }
-
-  const token = authHeader.split(' ')[1];
 
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
@@ -20,9 +28,9 @@ function authenticate(req, res, next) {
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token expirado' });
+      return sendError(res, 401, 'Sesión expirada, inicia sesión nuevamente', 'AUTH_TOKEN_EXPIRED');
     }
-    return res.status(401).json({ error: 'Token inválido' });
+    return sendError(res, 401, 'Token inválido', 'AUTH_TOKEN_INVALID');
   }
 }
 
