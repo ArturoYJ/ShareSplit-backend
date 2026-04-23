@@ -30,6 +30,19 @@ API REST para la gestión de gastos compartidos.
 | POST | `/api/groups/:gId/payments` | Registrar pago/reembolso |
 | GET  | `/api/groups/:gId/payments` | Historial de pagos |
 
+## Reglas financieras clave
+
+- Los pagos validan `no sobrepago`: no se permite registrar un monto mayor a la deuda activa entre deudor y acreedor.
+- `settle-all` y liquidación por gasto se bloquean si existen ítems sin reclamar.
+
+## Pruebas de integración
+
+```bash
+npm run test:integration
+```
+
+> Requiere `DATABASE_URL` apuntando a una base con migraciones aplicadas.
+
 ## Setup local (sin Docker)
 
 ```bash
@@ -46,6 +59,13 @@ cd ../infra && docker compose up -d postgres
 # 4. Arrancar en modo desarrollo
 npm run dev
 ```
+
+Variables opcionales de hardening:
+
+- `TRUST_PROXY`
+- `RATE_LIMIT_GLOBAL_MAX`
+- `RATE_LIMIT_AUTH_MAX`
+- `RATE_LIMIT_PAYMENTS_MAX`
 
 ## Setup con Docker (recomendado)
 
