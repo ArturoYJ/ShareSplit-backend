@@ -21,20 +21,28 @@ function signToken(user) {
  * Emite la cookie httpOnly ss_token.
  * - httpOnly: no accesible por JS en el navegador (previene XSS)
  * - secure: solo HTTPS en producción
- * - sameSite: 'lax' bloquea CSRF en navegadores modernos
- * - maxAge: igual al TTL del JWT (7 días por defecto)
+ * - sameSite: 'none' en prod (frontend en Vercel, backend en Render = cross-site)
+ * - partitioned: requerido por Chrome ≥ 118 para cookies third-party (CHIPS)
  */
-function setAuthCookie(res, token) {
+function buildCookieOptions() {
   const isProd = process.env.NODE_ENV === 'production';
-  // parseInt('7d', 10) returns NaN — strip non-numeric chars before parsing
-  const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
-  const maxAgeDays = parseInt(expiresIn.replace(/[^0-9]/g, ''), 10) || 7;
-  res.cookie('ss_token', token, {
+  return {
     httpOnly: true,
     secure: isProd,
     sameSite: isProd ? 'none' : 'lax',
-    maxAge: maxAgeDays * 24 * 60 * 60 * 1000,
     path: '/',
+    // Partitioned solo tiene sentido en prod (cross-site + secure)
+    ...(isProd ? { partitioned: true } : {}),
+  };
+}
+
+function setAuthCookie(res, token) {
+  const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
+  const maxAgeDays = parseInt(String(expiresIn).replace(/[^0-9]/g, ''), 10) || 7;
+
+  res.cookie('ss_token', token, {
+    ...buildCookieOptions(),
+    maxAge: maxAgeDays * 24 * 60 * 60 * 1000,
   });
 }
 
@@ -64,7 +72,6 @@ router.post(
     const { name, email, password } = req.body;
 
     try {
-      // Verificar si ya existe
       const existing = await pool.query(
         'SELECT id FROM users WHERE email = $1',
         [email]
@@ -73,10 +80,8 @@ router.post(
         return sendError(res, 409, 'El email ya está registrado', 'AUTH_EMAIL_EXISTS');
       }
 
-      // Hash de la contraseña
       const hash = await bcrypt.hash(password, 12);
 
-      // Insertar usuario
       const result = await pool.query(
         `INSERT INTO users (name, email, password)
          VALUES ($1, $2, $3)
@@ -167,14 +172,8 @@ router.get('/me', authenticate, async (req, res) => {
 // ── POST /auth/logout — Cierra sesión (limpia cookie) ─────────────────────────
 
 router.post('/logout', (_req, res) => {
-  const isProd = process.env.NODE_ENV === 'production';
-  // Attributes must match those used in setAuthCookie; otherwise browsers ignore clearCookie
-  res.clearCookie('ss_token', {
-    path: '/',
-    httpOnly: true,
-    secure: isProd,
-    sameSite: isProd ? 'none' : 'lax',
-  });
+  // Los atributos deben coincidir con setAuthCookie; si no, el navegador ignora el clear.
+  res.clearCookie('ss_token', buildCookieOptions());
   res.json({ message: 'Sesión cerrada' });
 });
 
@@ -208,13 +207,11 @@ router.patch(
     const { name, email, avatar_url } = req.body;
     const userId = req.user.id;
 
-    // Si no viene ningún campo, nada que actualizar
     if (name === undefined && email === undefined && avatar_url === undefined) {
       return sendError(res, 400, 'Debes enviar al menos un campo para actualizar', 'NO_FIELDS_PROVIDED');
     }
 
     try {
-      // Verificar unicidad de email si se va a cambiar
       if (email) {
         const emailCheck = await pool.query(
           'SELECT id FROM users WHERE email = $1 AND id != $2',

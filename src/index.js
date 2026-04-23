@@ -1,12 +1,12 @@
 require('dotenv').config();
 
-// ── 3.3 Validación temprana de variables de entorno críticas ─────────────────────
+// ── Validación temprana de variables de entorno críticas ─────────────────────
 (function validateEnv() {
   const jwtSecret = process.env.JWT_SECRET || '';
   if (!jwtSecret || jwtSecret.length < 32) {
     console.error(
       '\u274C  [FATAL] JWT_SECRET no está configurado o tiene menos de 32 caracteres.',
-      '\n         Configura JWT_SECRET en backend/.env antes de iniciar.'
+      '\n         Configura JWT_SECRET antes de iniciar.'
     );
     process.exit(1);
   }
@@ -34,17 +34,38 @@ const balancesRouter = require('./routes/balances');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ── CORS: orígenes literales + regex para previews de Vercel ─────────────────
 function resolveCorsOrigins() {
-  const configured = process.env.CORS_ORIGIN || 'http://localhost:3000';
-  return configured
+  return (process.env.CORS_ORIGIN || 'http://localhost:3000')
     .split(',')
-    .map((origin) => origin.trim())
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+function resolveCorsRegexes() {
+  // CORS_ORIGIN_REGEX puede ser una lista coma-separada. Sin delimitadores, sin flags.
+  // Ejemplo: ^https:\/\/sharesplit-frontend(-[a-z0-9-]+)?\.vercel\.app$
+  return (process.env.CORS_ORIGIN_REGEX || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((src) => {
+      try {
+        return new RegExp(src);
+      } catch (e) {
+        console.warn(`[CORS] Regex inválida ignorada: ${src} (${e.message})`);
+        return null;
+      }
+    })
     .filter(Boolean);
 }
 
 const allowedOrigins = resolveCorsOrigins();
+const allowedRegexes = resolveCorsRegexes();
 
-app.set('trust proxy', process.env.TRUST_PROXY === '1');
+// Render y otros hostings corren detrás de un proxy TLS.
+// Sin esto, express-rate-limit ve a todos los usuarios como el mismo IP.
+app.set('trust proxy', process.env.TRUST_PROXY === '1' ? 1 : 0);
 
 app.use(
   helmet({
@@ -55,22 +76,21 @@ app.use(
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+      if (!origin) return callback(null, true); // curl, healthchecks, SSR
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      if (allowedRegexes.some((r) => r.test(origin))) return callback(null, true);
       return callback(new Error('Origin no permitido por CORS'));
     },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   })
 );
 
 app.use(express.json({ limit: '500kb' }));
-// extended: false — this is a JSON API; the qs parser is unnecessary
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 
-
-
+// ── Rate limiting ────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.RATE_LIMIT_GLOBAL_MAX || 800),
@@ -89,9 +109,9 @@ const authLimiter = rateLimit({
     sendError(res, 429, 'Demasiados intentos de autenticación', 'AUTH_RATE_LIMIT_EXCEEDED'),
 });
 
-
 app.use('/api', globalLimiter);
 
+// ── Rutas ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -118,7 +138,7 @@ app.use((err, _req, res, _next) => {
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`[ShareSplit API] Servidor corriendo en http://localhost:${PORT}`);
+    console.log(`[ShareSplit API] Servidor corriendo en puerto ${PORT}`);
     console.log(`[ShareSplit API] Entorno: ${process.env.NODE_ENV || 'development'}`);
   });
 }
