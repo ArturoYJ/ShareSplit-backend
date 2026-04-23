@@ -2,8 +2,9 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // En producción usa SSL:
-  // ssl: { rejectUnauthorized: false }
+  // In production, enable SSL with a verified certificate:
+  // ssl: { rejectUnauthorized: true }
+  // Never use rejectUnauthorized: false in production — it disables certificate validation.
 });
 
 pool.on('error', (err) => {
