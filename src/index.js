@@ -65,7 +65,8 @@ app.use(
 );
 
 app.use(express.json({ limit: '500kb' }));
-app.use(express.urlencoded({ extended: true }));
+// extended: false — this is a JSON API; the qs parser is unnecessary
+app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 
 
